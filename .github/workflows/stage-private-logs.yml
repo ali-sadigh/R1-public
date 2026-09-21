@@ -55,8 +55,8 @@ jobs:
             --title "Logs for Public PR #${PR_NUM}" \
             --notes "Private staging log uploads for public PR #${PR_NUM}" || true
             
-          # Upload the versioned log bundle without overwriting older commits
-          gh release upload "$TAG_NAME" "${{ env.ASSET_NAME }}" \
+          # Reference $ASSET_NAME as a standard bash variable
+          gh release upload "$TAG_NAME" "$ASSET_NAME" \
             --repo "$PRIVATE_REPO" --clobber
 
   # =========================================================================
