@@ -1,0 +1,81 @@
+name: Stage & Lifecycle Private Benchmark Logs
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, closed]
+
+jobs:
+  # =========================================================================
+  # JOB 1: Upload logs to Private Repo when PR is opened or updated
+  # =========================================================================
+  stage-logs:
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Safely check out the contributor's PR branch code to inspect staging_logs/
+      - name: Checkout PR Head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # 2. Check if staging_logs directory exists and contains files
+      - name: Check for Staging Logs
+        id: check_logs
+        run: |
+          if [ -d "staging_logs" ] && [ "$(ls -A staging_logs)" ]; then
+            echo "has_logs=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_logs=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 3. Compress the contents of staging_logs with a unique commit SHA suffix
+      - name: Bundle Logs with Versioning
+        if: steps.check_logs.outputs.has_logs == 'true'
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          SHORT_SHA="${{ github.event.pull_request.head.sha }}"
+          ASSET_NAME="PR-${PR_NUM}-logs-${SHORT_SHA:0:7}.tar.gz"
+          
+          echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_ENV
+          tar -czvf "${ASSET_NAME}" -C staging_logs .
+
+      # 4. Create or update the private release and attach the log bundle
+      - name: Push Asset to Private Repository
+        if: steps.check_logs.outputs.has_logs == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_STAGING_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PRIVATE_REPO: "ali-sadigh/R1-private"
+        run: |
+          TAG_NAME="pr-${PR_NUM}"
+          
+          # Create tag/release if it doesn't exist yet
+          gh release create "$TAG_NAME" \
+            --repo "$PRIVATE_REPO" \
+            --title "Logs for Public PR #${PR_NUM}" \
+            --notes "Private staging log uploads for public PR #${PR_NUM}" || true
+            
+          # Upload the versioned log bundle without overwriting older commits
+          gh release upload "$TAG_NAME" "${{ env.ASSET_NAME }}" \
+            --repo "$PRIVATE_REPO" --clobber
+
+  # =========================================================================
+  # JOB 2: Automatically purge private staging release when PR is closed
+  # =========================================================================
+  # cleanup-staging-logs:
+  #   if: github.event.action == 'closed'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Purge Private Release and Tag
+  #       env:
+  #         GH_TOKEN: ${{ secrets.PRIVATE_STAGING_TOKEN }}
+  #         PR_NUM: ${{ github.event.pull_request.number }}
+  #         PRIVATE_REPO: "ali-sadigh/R1-private"
+  #       run: |
+  #         TAG_NAME="pr-${PR_NUM}"
+          
+  #         echo "Cleaning up private release asset '${TAG_NAME}' from ${PRIVATE_REPO}..."
+  #         gh release delete "$TAG_NAME" \
+  #           --repo "$PRIVATE_REPO" \
+  #           --cleanup-tag \
+  #           --yes || echo "No private staging release found for ${TAG_NAME}, skipping."
