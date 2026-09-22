@@ -1,18 +1,8 @@
-name: Stage & Lifecycle Private Benchmark Logs
-
-on:
-  pull_request_target:
-    types: [opened, synchronize, closed]
-
-jobs:
-  # =========================================================================
-  # JOB 1: Upload logs to Private Repo when PR is opened or updated
-  # =========================================================================
-  stage-logs:
+stage-logs:
     if: github.event.action == 'opened' || github.event.action == 'synchronize'
     runs-on: ubuntu-latest
     steps:
-      # 1. Safely check out the contributor's PR branch code to inspect staging_logs/
+      # 1. Check out the fork's PR commit safely
       - name: Checkout PR Head
         uses: actions/checkout@v4
         with:
@@ -29,7 +19,7 @@ jobs:
             echo "has_logs=false" >> $GITHUB_OUTPUT
           fi
 
-      # 3. Compress the contents of staging_logs with a unique commit SHA suffix
+      # 3. Compress contents of staging_logs, ignoring .gitkeep
       - name: Bundle Logs with Versioning
         if: steps.check_logs.outputs.has_logs == 'true'
         run: |
@@ -40,7 +30,7 @@ jobs:
           echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_ENV
           tar --exclude='.*' -czvf "${ASSET_NAME}" -C staging_logs .
 
-      # 4. Create or update the private release and attach the log bundle
+      # 4. Push to private staging repository
       - name: Push Asset to Private Repository
         if: steps.check_logs.outputs.has_logs == 'true'
         env:
@@ -50,33 +40,10 @@ jobs:
         run: |
           TAG_NAME="pr-${PR_NUM}"
           
-          # Create tag/release if it doesn't exist yet
           gh release create "$TAG_NAME" \
             --repo "$PRIVATE_REPO" \
             --title "Logs for Public PR #${PR_NUM}" \
             --notes "Private staging log uploads for public PR #${PR_NUM}" || true
             
-          # Reference $ASSET_NAME as a standard bash variable
           gh release upload "$TAG_NAME" "$ASSET_NAME" \
             --repo "$PRIVATE_REPO" --clobber
-
-  # =========================================================================
-  # JOB 2: Automatically purge private staging release when PR is closed
-  # =========================================================================
-  # cleanup-staging-logs:
-  #   if: github.event.action == 'closed'
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Purge Private Release and Tag
-  #       env:
-  #         GH_TOKEN: ${{ secrets.PRIVATE_STAGING_TOKEN }}
-  #         PR_NUM: ${{ github.event.pull_request.number }}
-  #         PRIVATE_REPO: "ali-sadigh/R1-private"
-  #       run: |
-  #         TAG_NAME="pr-${PR_NUM}"
-          
-  #         echo "Cleaning up private release asset '${TAG_NAME}' from ${PRIVATE_REPO}..."
-  #         gh release delete "$TAG_NAME" \
-  #           --repo "$PRIVATE_REPO" \
-  #           --cleanup-tag \
-  #           --yes || echo "No private staging release found for ${TAG_NAME}, skipping."
