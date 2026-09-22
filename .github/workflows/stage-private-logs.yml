@@ -37,7 +37,7 @@ jobs:
           ASSET_NAME="PR-${PR_NUM}-logs-${SHORT_SHA:0:7}.tar.gz"
           
           echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_ENV
-          tar -czvf "${ASSET_NAME}" -C staging_logs .
+          tar --exclude='.*' -czvf "${ASSET_NAME}" -C staging_logs .
 
       # 4. Create or update the private release and attach the log bundle
       - name: Push Asset to Private Repository
