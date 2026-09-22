@@ -1,49 +1,207 @@
-stage-logs:
-    if: github.event.action == 'opened' || github.event.action == 'synchronize'
-    runs-on: ubuntu-latest
-    steps:
-      # 1. Check out the fork's PR commit safely
-      - name: Checkout PR Head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          allow-unsafe-pr-checkout: true
+name: Stage Private Benchmark Logs
 
-      # 2. Check if staging_logs directory exists and contains files
-      - name: Check for Staging Logs
-        id: check_logs
+# Contributors publish their benchmark logs as a release on their own fork and
+# paste the release link into the pull request description. This workflow copies
+# those assets into a private repository so they can be reviewed before they are
+# published. Log files never enter this repository's git history.
+
+on:
+  pull_request_target:
+    # 'edited' matters: a contributor who opens the pull request before pasting
+    # the link cannot re-run a failed check themselves, but editing the
+    # description retriggers this workflow for them.
+    types: [opened, edited, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: stage-logs-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: ali-sadigh/R1-private
+
+jobs:
+  stage-logs:
+    name: Stage logs to private repository
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # The pull request body is attacker-controlled text, so it is read from an
+      # environment variable rather than interpolated into the script.
+      - name: Find the logs release
+        id: find
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          if [ -d "staging_logs" ] && [ "$(ls -A staging_logs)" ]; then
-            echo "has_logs=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_logs=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          urls=$(printf '%s' "$BODY" \
+            | grep -oiE 'https://github\.com/[^/[:space:]]+/[^/[:space:]]+/releases/tag/[^][:space:])>",]+' \
+            || true)
+
+          if [ -z "$urls" ]; then
+            echo "No release link in the description; treating this as a data-only pull request."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-      # 3. Compress contents of staging_logs, ignoring .gitkeep
-      - name: Bundle Logs with Versioning
-        if: steps.check_logs.outputs.has_logs == 'true'
-        run: |
-          PR_NUM="${{ github.event.pull_request.number }}"
-          SHORT_SHA="${{ github.event.pull_request.head.sha }}"
-          ASSET_NAME="PR-${PR_NUM}-logs-${SHORT_SHA:0:7}.tar.gz"
-          
-          echo "ASSET_NAME=${ASSET_NAME}" >> $GITHUB_ENV
-          tar --exclude='.*' -czvf "${ASSET_NAME}" -C staging_logs .
+          # Only a release on the pull request's own fork is eligible. Anything
+          # else would let the description point this job, and its token, at an
+          # arbitrary repository. Other release links in the description are
+          # ignored rather than treated as errors.
+          source_repo=""
+          while IFS= read -r candidate; do
+            repo=$(printf '%s' "$candidate" | sed -E 's#https://github\.com/([^/]+/[^/]+)/releases/tag/.*#\1#I')
+            if [ "${repo,,}" = "${HEAD_REPO,,}" ]; then
+              source_repo="$repo"
+              tag=$(printf '%s' "$candidate" | sed -E 's#.*/releases/tag/##')
+              break
+            fi
+          done <<< "$urls"
 
-      # 4. Push to private staging repository
-      - name: Push Asset to Private Repository
-        if: steps.check_logs.outputs.has_logs == 'true'
+          if [ -z "$source_repo" ]; then
+            echo "::error::The description links to a release, but not one on '$HEAD_REPO'. Publish the logs as a release on your own fork and link to that."
+            exit 1
+          fi
+
+          if ! printf '%s' "$tag" | grep -qE '^[A-Za-z0-9._/-]+$'; then
+            echo "::error::Release tag '$tag' contains unexpected characters. Use a tag made of letters, digits, dots, dashes, underscores or slashes."
+            exit 1
+          fi
+
+          echo "Found release '$tag' in $source_repo."
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "source_repo=$source_repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Copy assets into the private repository
+        id: copy
+        if: steps.find.outputs.found == 'true'
+        env:
+          READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WRITE_TOKEN: ${{ secrets.PRIVATE_STAGING_TOKEN }}
+          SOURCE_REPO: ${{ steps.find.outputs.source_repo }}
+          TAG: ${{ steps.find.outputs.tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$WRITE_TOKEN" ]; then
+            echo "::error::The PRIVATE_STAGING_TOKEN secret is not set on this repository."
+            exit 1
+          fi
+
+          dest_tag="pr-$PR_NUMBER"
+          assets() { gh release view "$1" --repo "$2" --json assets \
+                       --jq '.assets[] | [.name, .size] | @tsv' | sort; }
+
+          if ! GH_TOKEN="$READ_TOKEN" gh release view "$TAG" --repo "$SOURCE_REPO" >/dev/null 2>&1; then
+            echo "::error::No release tagged '$TAG' found in $SOURCE_REPO. Check the link in the description, and make sure the release is published rather than a draft."
+            exit 1
+          fi
+
+          want=$(GH_TOKEN="$READ_TOKEN" assets "$TAG" "$SOURCE_REPO")
+          if [ -z "$want" ]; then
+            echo "::error::Release '$TAG' in $SOURCE_REPO has no files attached. Edit the release and drag your log files into it."
+            exit 1
+          fi
+
+          count=$(printf '%s\n' "$want" | wc -l)
+          bytes=$(printf '%s\n' "$want" | cut -f2 | awk '{ total += $1 } END { print total + 0 }')
+          echo "Source release holds $count file(s), $(numfmt --to=iec "$bytes")."
+
+          if GH_TOKEN="$WRITE_TOKEN" gh release view "$dest_tag" --repo "$PRIVATE_REPO" >/dev/null 2>&1; then
+            if [ "$(GH_TOKEN="$WRITE_TOKEN" assets "$dest_tag" "$PRIVATE_REPO")" = "$want" ]; then
+              echo "Already staged and unchanged; nothing to copy."
+              echo "count=$count" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            GH_TOKEN="$WRITE_TOKEN" gh release create "$dest_tag" --repo "$PRIVATE_REPO" \
+              --title "Logs for public PR #$PR_NUMBER" \
+              --notes "Copied from $SOURCE_REPO release \`$TAG\` for ${{ github.repository }}#$PR_NUMBER."
+          fi
+
+          # One file at a time, removed after upload, so a large submission cannot
+          # fill the runner's disk.
+          mkdir -p "$RUNNER_TEMP/assets"
+          printf '%s\n' "$want" | cut -f1 | while IFS= read -r name; do
+            echo "Copying $name"
+            GH_TOKEN="$READ_TOKEN" gh release download "$TAG" --repo "$SOURCE_REPO" \
+              --pattern "$name" --dir "$RUNNER_TEMP/assets" --clobber
+            GH_TOKEN="$WRITE_TOKEN" gh release upload "$dest_tag" "$RUNNER_TEMP/assets/$name" \
+              --repo "$PRIVATE_REPO" --clobber
+            rm -f "$RUNNER_TEMP/assets/$name"
+          done
+
+          # Read the private release back so the check only passes on files that
+          # are really there.
+          missing=$(comm -23 <(printf '%s\n' "$want") \
+                             <(GH_TOKEN="$WRITE_TOKEN" assets "$dest_tag" "$PRIVATE_REPO") | cut -f1)
+          if [ -n "$missing" ]; then
+            echo "::error::These files did not arrive in the private repository: $(printf '%s' "$missing" | tr '\n' ' ')"
+            exit 1
+          fi
+
+          echo "Staged $count file(s) into $PRIVATE_REPO release $dest_tag."
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Report result on the pull request
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FOUND: ${{ steps.find.outputs.found }}
+          FIND: ${{ steps.find.outcome }}
+          COPY: ${{ steps.copy.outcome }}
+          COUNT: ${{ steps.copy.outputs.count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- stage-private-logs -->"
+
+          if [ "$FIND" != "success" ]; then
+            body="**Could not read the logs release.** See the [run log]($RUN_URL)."
+          elif [ "$FOUND" != "true" ]; then
+            body="**No logs in this pull request.** The description has no release link, so this is treated as a data-only change. If you meant to submit logs, publish them as a release on your fork and paste the link into the description; editing it will rerun this check."
+          elif [ "$COPY" = "success" ]; then
+            body="**Logs staged privately.** $COUNT file(s) were copied into the private staging repository. Nothing further is needed from you, and you can delete the release from your fork whenever you like."
+          else
+            body="**Log staging failed.** This pull request cannot be merged until it passes. The [run log]($RUN_URL) explains what went wrong; fixing the release and editing the description will rerun this check."
+          fi
+
+          comment=$(printf '%s\n%s\n' "$marker" "$body")
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+                --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -1)
+
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$comment" >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$comment" >/dev/null
+          fi
+
+  # Staged logs are never deleted automatically. A closed-but-unmerged pull
+  # request is not necessarily a rejection: it may be a logs-only submission
+  # that was collected and then closed because there was nothing to merge.
+  # Closing only retitles the release so its status is visible at a glance, and
+  # clearing anything out stays a deliberate act.
+  mark-closed:
+    name: Mark staging release as closed
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Retitle private release
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_STAGING_TOKEN }}
-          PR_NUM: ${{ github.event.pull_request.number }}
-          PRIVATE_REPO: "ali-sadigh/R1-private"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGED: ${{ github.event.pull_request.merged }}
         run: |
-          TAG_NAME="pr-${PR_NUM}"
-          
-          gh release create "$TAG_NAME" \
-            --repo "$PRIVATE_REPO" \
-            --title "Logs for Public PR #${PR_NUM}" \
-            --notes "Private staging log uploads for public PR #${PR_NUM}" || true
-            
-          gh release upload "$TAG_NAME" "$ASSET_NAME" \
-            --repo "$PRIVATE_REPO" --clobber
+          if [ "$MERGED" = "true" ]; then state=ACCEPTED; else state=CLOSED; fi
+          gh release edit "pr-$PR_NUMBER" --repo "$PRIVATE_REPO" \
+            --title "$state - logs for public PR #$PR_NUMBER" \
+            || echo "No staging release for pr-$PR_NUMBER; this PR carried no logs."
