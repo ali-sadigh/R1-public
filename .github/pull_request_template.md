@@ -24,8 +24,7 @@ is done. Wait for that comment before deleting the release from your fork.
 
 Opened this pull request before the link was ready? Paste it and save;
 that reruns the check.
-
-Leave the line blank if this change has no logs.
 -->
 
 Logs release:
+<!-- Leave this blank if this change has no logs. -->
