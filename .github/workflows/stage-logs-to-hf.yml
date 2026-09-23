@@ -104,8 +104,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Namespaced by source repository so several repositories can stage
-          # into the same bucket without colliding on pull request numbers.
+          # Namespaced by this repository so several repos can share one bucket
+          # without colliding on pull request numbers.
           prefix="$GITHUB_REPOSITORY/pr-$PR_NUMBER"
 
           if ! GH_TOKEN="$READ_TOKEN" gh release view "$TAG" --repo "$SOURCE_REPO" >/dev/null 2>&1; then
@@ -206,6 +206,10 @@ jobs:
         run: |
           set -euo pipefail
           prefix="$GITHUB_REPOSITORY/pr-$PR_NUMBER"
+
+          # Listing the bucket root must succeed; otherwise this is an auth or
+          # network failure, not "this pull request had no logs."
+          hf buckets list "$HF_BUCKET" -q >/dev/null
 
           if ! hf buckets list "$HF_BUCKET/$prefix" -R -q >/dev/null 2>&1; then
             echo "No staged logs for $prefix; this pull request carried none."
