@@ -12,8 +12,8 @@ Submitting benchmark logs? Publish them on your own fork first:
      dropping them here" (up to 2 GB per file)
   3. Publish the release and paste its link below
 
-A bot copies the files into a private repository and confirms here when it is
-done. After that you can delete the release from your fork.
+A bot copies the files into private storage and confirms here when it is done.
+After that you can delete the release from your fork.
 
 Leave this blank for changes that carry no logs.
 -->
